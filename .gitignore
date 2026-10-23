@@ -1,0 +1,5 @@
+.env
+economy.db
+__pycache__/
+*.pyc
+.venv/
