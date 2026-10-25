@@ -306,39 +306,74 @@ class EconomyDatabase:
             )
             return await cursor.fetchall()
 
-    async def make_partial_payment(self, loan_id: int, user_id: int):
+    async def make_partial_payment(self, loan_id: int, user_id: int, payment_amount: int):
+        """
+        Принимает произвольную сумму платежа.
+        Возвращает: (успех, сообщение, новый_долг, новая_дата)
+        """
         import math
+        from datetime import datetime, timedelta
+
         async with aiosqlite.connect(self.db_path) as db:
+            # Получаем данные кредита
             cursor = await db.execute(
-                "SELECT current_debt FROM loans WHERE loan_id = ? AND user_id = ? AND is_active = 1",
+                "SELECT current_debt, initial_amount FROM loans WHERE loan_id = ? AND user_id = ? AND is_active = 1",
                 (loan_id, user_id)
             )
             loan = await cursor.fetchone()
+
             if not loan:
-                return False, "Кредит не найден", 0, None
+                return False, "Кредит не найден или уже закрыт", 0, None
 
-            debt = loan[0]
-            part = math.ceil(debt / 8)
-            fee = math.ceil(part * 0.05)
-            total = part + fee
+            current_debt, initial_amount = loan
 
+            # Проверяем, что платеж в допустимых границах (дублируем проверку из команды для безопасности)
+            min_payment = max(1, initial_amount // 8)
+            if payment_amount < min_payment or payment_amount > current_debt:
+                return False, f"Платеж должен быть от {min_payment} до {current_debt}", current_debt, None
+
+            # Рассчитываем комиссию 5% от ВНОСИМОЙ суммы
+            fee = math.ceil(payment_amount * 0.05)
+            total_cost = payment_amount + fee
+
+            # Проверяем баланс пользователя
             cursor = await db.execute("SELECT smith_tokens FROM users WHERE user_id = ?", (user_id,))
-            tokens = (await cursor.fetchone())[0]
-            if tokens < total:
-                return False, f"Нужно {total} смиттокенов", debt, None
+            tokens_row = await cursor.fetchone()
+            user_balance = tokens_row[0] if tokens_row else 0
 
-            await db.execute(
-                "UPDATE users SET smith_tokens = smith_tokens - ? WHERE user_id = ?",
-                (total, user_id)
-            )
-            new_debt = debt - part
-            new_due = datetime.now() + timedelta(hours=96)
-            await db.execute(
-                "UPDATE loans SET current_debt = ?, due_date = ?, last_payment_at = CURRENT_TIMESTAMP WHERE loan_id = ?",
-                (new_debt, new_due.isoformat(), loan_id)
-            )
+            if user_balance < total_cost:
+                return False, f"Недостаточно средств. Нужно: {total_cost} (платеж {payment_amount} + комиссия {fee})", current_debt, None
+
+            # Выполняем транзакцию
+            new_debt = current_debt - payment_amount
+            if new_debt < 0:
+                new_debt = 0  # Не уходим в минус
+
+            new_due_date = datetime.now() + timedelta(hours=96)
+
+            # Списываем средства
+            await db.execute("UPDATE users SET smith_tokens = smith_tokens - ? WHERE user_id = ?",
+                             (total_cost, user_id))
+
+            if new_debt == 0:
+                # Кредит полностью погашен
+                await db.execute("UPDATE loans SET is_active = 0, current_debt = 0 WHERE loan_id = ?", (loan_id,))
+            else:
+                # Частичное погашение - сбрасываем таймер на 96ч
+                await db.execute(
+                    "UPDATE loans SET current_debt = ?, due_date = ?, last_payment_at = CURRENT_TIMESTAMP WHERE loan_id = ?",
+                    (new_debt, new_due_date.isoformat(), loan_id)
+                )
+
             await db.commit()
-            return True, f"Внесено {part}. Комиссия: {fee}. Остаток: {new_debt}", new_debt, new_due
+
+            # Формируем сообщение
+            if new_debt == 0:
+                msg = f"✅ Кредит полностью погашен!\nВнесено: {payment_amount}\nКомиссия: {fee}\nИтого списано: {total_cost}"
+            else:
+                msg = f"✅ Платеж принят\nВнесено: {payment_amount}\nКомиссия: {fee}\nИтого списано: {total_cost}\nОстаток долга: {new_debt}"
+
+            return True, msg, new_debt, new_due_date if new_debt > 0 else None
 
     async def apply_penalty(self, loan_id: int):
         import math
@@ -361,48 +396,49 @@ class EconomyDatabase:
         import math
         from config import GUILD_ID
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db.db_path) as db:
+            # Принудительно списываем 1/8 от ТЕКУЩЕГО долга + комиссия
             part = math.ceil(debt_amount / 8)
             fee = math.ceil(part * 0.05)
-            total = part + fee
+            total_to_take = part + fee
 
-            cursor = await db.execute(
-                "SELECT smith_tokens FROM users WHERE user_id = ?", (user_id,)
-            )
+            cursor = await db.execute("SELECT smith_tokens FROM users WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
-            current = row[0] if row else 0
-            new_bal = current - total
+            current_balance = row[0] if row else 0
 
-            await db.execute(
-                "UPDATE users SET smith_tokens = ? WHERE user_id = ?",
-                (new_bal, user_id)
-            )
+            new_balance = current_balance - total_to_take
+
+            # Списываем средства
+            await db.execute("UPDATE users SET smith_tokens = ? WHERE user_id = ?", (new_balance, user_id))
+
+            # Уменьшаем долг на сумму основного платежа (без комиссии)
             await db.execute(
                 "UPDATE loans SET current_debt = current_debt - ? WHERE user_id = ? AND is_active = 1",
                 (part, user_id)
             )
 
+            # Управление штрафной ролью
             guild = self.bot.get_guild(GUILD_ID) if hasattr(self, 'bot') else None
             if guild:
                 member = guild.get_member(user_id)
                 if member:
-                    if new_bal < 0:
-                        role = guild.get_role(penalty_role_id)
-                        if role:
-                            await member.add_roles(role)
-                            await db.execute(
-                                "INSERT OR REPLACE INTO user_penalties VALUES (?, ?, ?)",
-                                (user_id, penalty_role_id, (datetime.now() + timedelta(days=7)).isoformat())
-                            )
-                    else:
-                        role = guild.get_role(penalty_role_id)
-                        if role and role in member.roles:
-                            await member.remove_roles(role)
-                            await db.execute(
-                                "DELETE FROM user_penalties WHERE user_id = ?", (user_id,)
-                            )
+                    role = guild.get_role(penalty_role_id)
+                    if role:
+                        if new_balance < 0:
+                            if role not in member.roles:
+                                await member.add_roles(role)
+                                expire_time = datetime.now() + timedelta(days=7)
+                                await db.execute(
+                                    "INSERT OR REPLACE INTO user_penalties VALUES (?, ?, ?)",
+                                    (user_id, penalty_role_id, expire_time.isoformat())
+                                )
+                        else:
+                            if role in member.roles:
+                                await member.remove_roles(role)
+                                await db.execute("DELETE FROM user_penalties WHERE user_id = ?", (user_id,))
+
             await db.commit()
-            return new_bal, total
+            return new_balance, total_to_take
 
     # --- Достижения ---
 
